@@ -15,7 +15,7 @@
 //!```
 
 #![warn(missing_docs)]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::style))]
+// #![cfg_attr(feature = "cargo-clippy", allow(clippy::style))]
 
 use core::num;
 use std::io::Write;
