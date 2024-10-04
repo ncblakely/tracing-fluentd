@@ -17,14 +17,15 @@
 #![warn(missing_docs)]
 #![cfg_attr(feature = "cargo-clippy", allow(clippy::style))]
 
-use std::net::{TcpStream, SocketAddrV4, SocketAddr, Ipv4Addr};
-use std::io::Write;
 use core::num;
+use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::time::Duration;
 
-mod tracing;
-pub mod fluent;
-mod worker;
 mod default_writers;
+pub mod fluent;
+mod tracing;
+mod worker;
 
 pub use self::tracing::FieldFormatter;
 
@@ -86,11 +87,13 @@ pub struct Layer<F, C> {
 ///
 ///- `F` - Attributes formatter, determines how to compose `fluent::Record`.
 ///- `A` - function that returns `Fluentd` wrter. Default is to create tcp socket towards `127.0.0.1:24224` with timeout of 1s.
-pub struct Builder<F=NestedFmt, A=fn() -> std::io::Result<TcpStream>> {
+pub struct Builder<F = NestedFmt, A = fn() -> std::io::Result<TcpStream>> {
     tag: &'static str,
     writer: A,
     fmt: F,
     max_msg_record: usize,
+    channel_capacity: Option<usize>,
+    channel_timeout: Option<Duration>,
 }
 
 impl Builder {
@@ -107,6 +110,8 @@ impl Builder {
             writer: default,
             fmt: NestedFmt,
             max_msg_record: DEFAULT_MAX_MSG_RECORD,
+            channel_capacity: None,
+            channel_timeout: None,
         }
     }
 
@@ -117,7 +122,9 @@ impl Builder {
             tag: self.tag,
             writer: self.writer,
             fmt: self.fmt,
-            max_msg_record: max_msg_record.get()
+            max_msg_record: max_msg_record.get(),
+            channel_capacity: self.channel_capacity,
+            channel_timeout: self.channel_timeout,
         }
     }
 }
@@ -132,6 +139,8 @@ impl<A: MakeWriter> Builder<NestedFmt, A> {
             writer: self.writer,
             fmt: FlattenFmt,
             max_msg_record: self.max_msg_record,
+            channel_capacity: None,
+            channel_timeout: None,
         }
     }
 }
@@ -145,6 +154,8 @@ impl<F: FieldFormatter, A: MakeWriter> Builder<F, A> {
             writer: self.writer,
             fmt,
             max_msg_record: self.max_msg_record,
+            channel_capacity: None,
+            channel_timeout: None,
         }
     }
 
@@ -159,6 +170,37 @@ impl<F: FieldFormatter, A: MakeWriter> Builder<F, A> {
             writer,
             fmt: self.fmt,
             max_msg_record: self.max_msg_record,
+            channel_capacity: None,
+            channel_timeout: None,
+        }
+    }
+
+    #[inline(always)]
+    /// Configures a bounded capacity for the channel that writes records.
+    /// Once the capacity is reached, the channel will block until there is capacity available,
+    /// or until the `channel_timeout` is reached.
+    pub fn with_channel_capacity(self, capacity: usize) -> Self {
+        Builder {
+            tag: self.tag,
+            writer: self.writer,
+            fmt: self.fmt,
+            max_msg_record: self.max_msg_record,
+            channel_capacity: Some(capacity),
+            channel_timeout: self.channel_timeout,
+        }
+    }
+
+    #[inline(always)]
+    /// Configures a timeout for the channel that writes records.
+    /// If the channel is at capacity and the timeout is reached, the record will be dropped.
+    pub fn with_channel_timeout(self, timeout: Duration) -> Self {
+        Builder {
+            tag: self.tag,
+            writer: self.writer,
+            fmt: self.fmt,
+            max_msg_record: self.max_msg_record,
+            channel_capacity: self.channel_capacity,
+            channel_timeout: Some(timeout),
         }
     }
 
@@ -170,7 +212,13 @@ impl<F: FieldFormatter, A: MakeWriter> Builder<F, A> {
     ///
     ///`Error` can happen during creation of worker thread.
     pub fn layer(self) -> Result<Layer<F, worker::ThreadWorker>, std::io::Error> {
-        let consumer = worker::thread(self.tag, self.writer, self.max_msg_record)?;
+        let consumer = worker::thread(
+            self.tag,
+            self.writer,
+            self.max_msg_record,
+            self.channel_capacity,
+            self.channel_timeout,
+        )?;
 
         Ok(Layer {
             consumer,
@@ -186,8 +234,16 @@ impl<F: FieldFormatter, A: MakeWriter> Builder<F, A> {
     ///is no longer necessary hence this API is provided.
     ///
     ///`Error` can happen during creation of worker thread.
-    pub fn layer_guarded(self) -> Result<(Layer<F, worker::WorkerChannel>, FlushingGuard), std::io::Error> {
-        let consumer = worker::thread(self.tag, self.writer, self.max_msg_record)?;
+    pub fn layer_guarded(
+        self,
+    ) -> Result<(Layer<F, worker::WorkerChannel>, FlushingGuard), std::io::Error> {
+        let consumer = worker::thread(
+            self.tag,
+            self.writer,
+            self.max_msg_record,
+            self.channel_capacity,
+            self.channel_timeout,
+        )?;
         let guard = FlushingGuard(consumer);
         let layer = Layer {
             consumer: worker::WorkerChannel(guard.0.sender()),

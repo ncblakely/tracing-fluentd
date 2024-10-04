@@ -1,4 +1,10 @@
 use core::{mem, time};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
+
+use crossbeam_channel::SendTimeoutError;
 
 use crate::{fluent, MakeWriter};
 
@@ -30,7 +36,9 @@ impl Consumer for WorkerChannel {
 
 pub struct ThreadWorker {
     sender: mem::ManuallyDrop<crossbeam_channel::Sender<Message>>,
+    send_timeouts: AtomicUsize,
     worker: mem::ManuallyDrop<std::thread::JoinHandle<()>>,
+    send_timeout: Option<Duration>,
 }
 
 impl ThreadWorker {
@@ -49,12 +57,31 @@ impl ThreadWorker {
 impl Consumer for ThreadWorker {
     #[inline(always)]
     fn record(&self, record: fluent::Record) {
-        let _ = self.sender.send(record.into());
+        if let Some(send_timeout) = self.send_timeout {
+            match self.sender.send_timeout(record.into(), send_timeout) {
+                Err(SendTimeoutError::Timeout(_)) => {
+                    self.send_timeouts.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(SendTimeoutError::Disconnected(_)) => return,
+                Ok(_) => {}
+            }
+        } else {
+            let _ = self.sender.send(record.into());
+        }
     }
 }
 
 impl Drop for ThreadWorker {
     fn drop(&mut self) {
+        let send_timeouts = self.send_timeouts.load(Ordering::Relaxed);
+        if send_timeouts > 0 {
+            tracing::event!(
+                tracing::Level::WARN,
+                "Fluent worker encountered {} send timeouts",
+                send_timeouts
+            );
+        }
+
         let worker = unsafe {
             mem::ManuallyDrop::drop(&mut self.sender);
             mem::ManuallyDrop::take(&mut self.worker)
@@ -65,10 +92,21 @@ impl Drop for ThreadWorker {
     }
 }
 
-pub fn thread<MW: MakeWriter>(tag: &'static str, writer: MW, max_msg_record: usize) -> std::io::Result<ThreadWorker> {
+pub fn thread<MW: MakeWriter>(
+    tag: &'static str,
+    writer: MW,
+    max_msg_record: usize,
+    channel_capacity: Option<usize>,
+    channel_timeout: Option<Duration>,
+) -> std::io::Result<ThreadWorker> {
     //const MAX_WAIT: time::Duration = time::Duration::from_secs(60);
 
-    let (sender, recv) = crossbeam_channel::unbounded();
+    let (sender, recv) = if let Some(channel_capacity) = channel_capacity {
+        crossbeam_channel::bounded(channel_capacity)
+    } else {
+        crossbeam_channel::unbounded()
+    };
+
     let worker = std::thread::Builder::new().name("tracing-fluentd-worker".to_owned());
 
     let worker = worker.spawn(move || {
@@ -80,7 +118,7 @@ pub fn thread<MW: MakeWriter>(tag: &'static str, writer: MW, max_msg_record: usi
             while msg.len() < max_msg_record {
                 match recv.recv() {
                     Ok(Message::Record(record)) => msg.add(record),
-                    Ok(Message::Terminate) | Err(crossbeam_channel::RecvError) => break 'main_loop
+                    Ok(Message::Terminate) | Err(crossbeam_channel::RecvError) => break 'main_loop,
                 }
             }
 
@@ -89,7 +127,9 @@ pub fn thread<MW: MakeWriter>(tag: &'static str, writer: MW, max_msg_record: usi
                 match recv.try_recv() {
                     Ok(Message::Record(record)) => msg.add(record),
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Ok(Message::Terminate) | Err(crossbeam_channel::TryRecvError::Disconnected) => break 'main_loop
+                    Ok(Message::Terminate) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        break 'main_loop
+                    }
                 }
             }
 
@@ -102,25 +142,33 @@ pub fn thread<MW: MakeWriter>(tag: &'static str, writer: MW, max_msg_record: usi
                         match writer.make() {
                             Ok(writer) => writer,
                             Err(error) => {
-                                tracing::event!(tracing::Level::DEBUG, "Failed to create fluent writer {}", error);
+                                tracing::event!(
+                                    tracing::Level::DEBUG,
+                                    "Failed to create fluent writer {}",
+                                    error
+                                );
                                 continue 'main_loop;
                             }
                         }
                     }
-                }
+                },
             };
 
             match rmp_serde::encode::write(&mut writer, &msg) {
                 Ok(()) => {
                     msg.clear();
                     ongoing_writer = Some(writer);
-                },
+                }
                 //In case of error we'll just retry at later date.
                 //Ideally we should be able to recover.
                 //But report error?
                 Err(error) => {
-                    tracing::event!(tracing::Level::INFO, "Failed to send records to fluent server {}", error);
-                },
+                    tracing::event!(
+                        tracing::Level::INFO,
+                        "Failed to send records to fluent server {}",
+                        error
+                    );
+                }
             }
         }
 
@@ -136,16 +184,24 @@ pub fn thread<MW: MakeWriter>(tag: &'static str, writer: MW, max_msg_record: usi
                             match writer.make() {
                                 Ok(writer) => writer,
                                 Err(error) => {
-                                    tracing::event!(tracing::Level::DEBUG, "Failed to create fluent writer {}", error);
-                                    continue
+                                    tracing::event!(
+                                        tracing::Level::DEBUG,
+                                        "Failed to create fluent writer {}",
+                                        error
+                                    );
+                                    continue;
                                 }
                             }
                         }
-                    }
+                    },
                 };
 
                 if let Err(error) = rmp_serde::encode::write(&mut writer, &msg) {
-                    tracing::event!(tracing::Level::INFO, "Failed to send last records to fluent server {}", error);
+                    tracing::event!(
+                        tracing::Level::INFO,
+                        "Failed to send last records to fluent server {}",
+                        error
+                    );
                     std::thread::sleep(time::Duration::from_secs(1));
                 } else {
                     break;
@@ -156,7 +212,8 @@ pub fn thread<MW: MakeWriter>(tag: &'static str, writer: MW, max_msg_record: usi
 
     Ok(ThreadWorker {
         sender: mem::ManuallyDrop::new(sender),
+        send_timeout: channel_timeout,
+        send_timeouts: AtomicUsize::new(0),
         worker: mem::ManuallyDrop::new(worker),
     })
-
 }
