@@ -277,6 +277,14 @@ impl<F: FieldFormatter, A: MakeWriter> Builder<F, A> {
 ///As part of destructor, it awaits to finish flushing `fluentd` records.
 pub struct FlushingGuard(worker::ThreadWorker);
 
+impl FlushingGuard {
+    /// Signals the worker to immediately send all pending records.
+    /// This is non-blocking; the flush happens on the worker thread.
+    pub fn flush(&self) {
+        self.0.flush();
+    }
+}
+
 impl Drop for FlushingGuard {
     fn drop(&mut self) {
         self.0.stop();

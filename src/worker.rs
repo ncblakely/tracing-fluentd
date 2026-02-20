@@ -10,6 +10,8 @@ use crate::{fluent, MakeWriter};
 
 pub enum Message {
     Record(fluent::Record),
+    /// Flush all pending records immediately without terminating.
+    Flush,
     Terminate,
 }
 
@@ -51,6 +53,13 @@ impl ThreadWorker {
     pub fn stop(&self) {
         let _result = self.sender.send(Message::Terminate);
         debug_assert!(_result.is_ok());
+    }
+
+    /// Sends a flush signal to the worker, causing it to immediately send
+    /// all pending records without terminating.
+    #[inline(always)]
+    pub fn flush(&self) {
+        let _ = self.sender.send(Message::Flush);
     }
 }
 
@@ -118,6 +127,7 @@ pub fn thread<MW: MakeWriter>(
             while msg.len() < max_msg_record {
                 match recv.recv() {
                     Ok(Message::Record(record)) => msg.add(record),
+                    Ok(Message::Flush) => break,
                     Ok(Message::Terminate) | Err(crossbeam_channel::RecvError) => break 'main_loop,
                 }
             }
@@ -126,7 +136,7 @@ pub fn thread<MW: MakeWriter>(
             loop {
                 match recv.try_recv() {
                     Ok(Message::Record(record)) => msg.add(record),
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Ok(Message::Flush) | Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Ok(Message::Terminate) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         break 'main_loop
                     }
