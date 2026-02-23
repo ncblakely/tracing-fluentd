@@ -1,6 +1,9 @@
 use core::{mem, time};
 use std::{
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{sync_channel, SyncSender},
+    },
     time::Duration,
 };
 
@@ -12,6 +15,8 @@ pub enum Message {
     Record(fluent::Record),
     /// Flush all pending records immediately without terminating.
     Flush,
+    /// Flush all pending records and notify completion via the channel.
+    FlushSync(SyncSender<()>),
     Terminate,
 }
 
@@ -60,6 +65,16 @@ impl ThreadWorker {
     #[inline(always)]
     pub fn flush(&self) {
         let _ = self.sender.send(Message::Flush);
+    }
+
+    /// Sends a flush signal and blocks until the worker has finished sending
+    /// all pending records, or until `timeout` elapses.
+    ///
+    /// Returns `true` if the flush completed within the timeout.
+    pub fn flush_blocking(&self, timeout: Duration) -> bool {
+        let (tx, rx) = sync_channel(0);
+        let _ = self.sender.send(Message::FlushSync(tx));
+        rx.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -123,11 +138,17 @@ pub fn thread<MW: MakeWriter>(
         let mut ongoing_writer = None;
 
         'main_loop: loop {
+            let mut flush_notify: Option<SyncSender<()>> = None;
+
             //Fetch up to max_msg_record
             while msg.len() < max_msg_record {
                 match recv.recv() {
                     Ok(Message::Record(record)) => msg.add(record),
                     Ok(Message::Flush) => break,
+                    Ok(Message::FlushSync(notify)) => {
+                        flush_notify = Some(notify);
+                        break;
+                    }
                     Ok(Message::Terminate) | Err(crossbeam_channel::RecvError) => break 'main_loop,
                 }
             }
@@ -137,6 +158,10 @@ pub fn thread<MW: MakeWriter>(
                 match recv.try_recv() {
                     Ok(Message::Record(record)) => msg.add(record),
                     Ok(Message::Flush) | Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Ok(Message::FlushSync(notify)) => {
+                        flush_notify = Some(notify);
+                        break;
+                    }
                     Ok(Message::Terminate) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         break 'main_loop
                     }
@@ -179,6 +204,10 @@ pub fn thread<MW: MakeWriter>(
                         error
                     );
                 }
+            }
+
+            if let Some(notify) = flush_notify {
+                let _ = notify.send(());
             }
         }
 

@@ -283,6 +283,14 @@ impl FlushingGuard {
     pub fn flush(&self) {
         self.0.flush();
     }
+
+    /// Signals the worker to send all pending records and blocks until
+    /// the flush completes or `timeout` elapses.
+    ///
+    /// Returns `true` if the flush completed within the timeout.
+    pub fn flush_blocking(&self, timeout: std::time::Duration) -> bool {
+        self.0.flush_blocking(timeout)
+    }
 }
 
 impl Drop for FlushingGuard {
