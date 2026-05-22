@@ -49,3 +49,5 @@ features = ["registry", "fmt"]
 [features]
 # Specifies to encode timestamp as EventTime instead of default unix timestamp
 event_time = []
+# Enables per-callsite payload attribution sidecar reporting.
+callsite_stats = []

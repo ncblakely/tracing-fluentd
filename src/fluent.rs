@@ -1,10 +1,11 @@
 //!Fluentd forward protocol definitions.
-use serde::ser::{Serialize, Serializer, SerializeTuple, SerializeMap};
+use serde::ser::{Serialize, SerializeMap, SerializeTuple, Serializer};
 
-use std::time;
 use core::fmt;
-use std::borrow::Cow;
 use indexmap::IndexMap;
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::time;
 
 #[derive(Clone)]
 #[repr(transparent)]
@@ -16,6 +17,15 @@ impl Map {
     ///Creates new empty map.
     pub fn new() -> Self {
         Self(IndexMap::new())
+    }
+
+    #[cfg(feature = "callsite_stats")]
+    #[inline(always)]
+    pub(crate) fn estimated_payload_bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|(key, value)| key.len() + value.estimated_payload_bytes())
+            .sum()
     }
 }
 
@@ -60,6 +70,8 @@ pub enum Value {
     Str(&'static str),
     ///Owned string
     String(String),
+    ///Shared string
+    SharedStr(Arc<str>),
     ///Event level
     EventLevel(tracing_core::Level),
     ///Object
@@ -108,6 +120,13 @@ impl From<String> for Value {
     }
 }
 
+impl From<Arc<str>> for Value {
+    #[inline(always)]
+    fn from(val: Arc<str>) -> Self {
+        Self::SharedStr(val)
+    }
+}
+
 impl From<tracing::Level> for Value {
     #[inline(always)]
     fn from(val: tracing::Level) -> Self {
@@ -132,7 +151,47 @@ impl fmt::Debug for Value {
             Value::EventLevel(val) => fmt::Debug::fmt(val, fmt),
             Value::Str(val) => fmt::Debug::fmt(val, fmt),
             Value::String(val) => fmt::Debug::fmt(val, fmt),
+            Value::SharedStr(val) => fmt::Debug::fmt(val, fmt),
             Value::Object(val) => fmt::Debug::fmt(val, fmt),
+        }
+    }
+}
+
+impl Value {
+    #[cfg(feature = "callsite_stats")]
+    #[inline(always)]
+    pub(crate) fn as_str_value(&self) -> Option<&str> {
+        match self {
+            Value::Str(val) => Some(val),
+            Value::String(val) => Some(val.as_str()),
+            Value::SharedStr(val) => Some(val.as_ref()),
+            Value::EventLevel(val) => Some(tracing_level_to_str(*val)),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "callsite_stats")]
+    #[inline(always)]
+    pub(crate) fn as_u64_value(&self) -> Option<u64> {
+        match self {
+            Value::Int(val) if *val >= 0 => Some(*val as u64),
+            Value::Uint(val) => Some(*val),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "callsite_stats")]
+    #[inline(always)]
+    pub(crate) fn estimated_payload_bytes(&self) -> usize {
+        match self {
+            Value::Bool(_) => 1,
+            Value::Int(val) => val.to_string().len(),
+            Value::Uint(val) => val.to_string().len(),
+            Value::Str(val) => val.len(),
+            Value::String(val) => val.len(),
+            Value::SharedStr(val) => val.len(),
+            Value::EventLevel(val) => tracing_level_to_str(*val).len(),
+            Value::Object(val) => val.estimated_payload_bytes(),
         }
     }
 }
@@ -168,6 +227,21 @@ impl Record {
             }
         }
     }
+
+    #[cfg(feature = "callsite_stats")]
+    #[inline(always)]
+    pub(crate) fn estimated_payload_bytes(&self) -> usize {
+        self.entries.estimated_payload_bytes() + 16
+    }
+
+    #[cfg(feature = "callsite_stats")]
+    #[inline(always)]
+    pub(crate) fn callsite_key(&self) -> Option<String> {
+        let module = self.entries.get("Module")?.as_str_value()?;
+        let file = self.entries.get("File")?.as_str_value()?;
+        let line = self.entries.get("LineNumber")?.as_u64_value()?;
+        Some(format!("{module}|{file}:{line}"))
+    }
 }
 
 impl core::ops::Deref for Record {
@@ -202,9 +276,7 @@ impl Message {
         Self {
             tag,
             entries: Vec::new(),
-            opts: Opts {
-                size: 0,
-            }
+            opts: Opts { size: 0 },
         }
     }
 
@@ -219,6 +291,12 @@ impl Message {
     ///Returns number of records inside message.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(feature = "callsite_stats")]
+    #[inline(always)]
+    pub(crate) fn records(&self) -> &[Record] {
+        self.entries.as_slice()
     }
 
     #[inline(always)]
@@ -253,13 +331,14 @@ impl Serialize for Value {
             Value::EventLevel(val) => ser.serialize_str(tracing_level_to_str(*val)),
             Value::Str(val) => ser.serialize_str(val),
             Value::String(val) => ser.serialize_str(val),
+            Value::SharedStr(val) => ser.serialize_str(val),
             Value::Object(val) => {
                 let mut map = ser.serialize_map(Some(val.len()))?;
                 for (key, value) in val.iter() {
                     map.serialize_entry(key, value)?;
                 }
                 map.end()
-            },
+            }
         }
     }
 }
@@ -321,7 +400,10 @@ impl Serialize for Record {
             let nanos = self.time.subsec_nanos();
             let seconds = (seconds as u32).to_be_bytes();
             let nanos = nanos.to_be_bytes();
-            let time = [seconds[0], seconds[1], seconds[2], seconds[3], nanos[0], nanos[1], nanos[2], nanos[3]];
+            let time = [
+                seconds[0], seconds[1], seconds[2], seconds[3], nanos[0], nanos[1], nanos[2],
+                nanos[3],
+            ];
             let time = ExtType((0, Int8(time)));
             seq.serialize_element(&time)?;
         }

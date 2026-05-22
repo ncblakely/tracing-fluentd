@@ -1,5 +1,6 @@
 use core::{mem, time};
 use std::{
+    io::Write,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{sync_channel, SyncSender},
@@ -10,6 +11,128 @@ use std::{
 use crossbeam_channel::SendTimeoutError;
 
 use crate::{fluent, MakeWriter};
+
+#[cfg(feature = "callsite_stats")]
+use std::{collections::HashMap, fmt::Write as FmtWrite, fs, time::Instant};
+
+#[cfg(feature = "callsite_stats")]
+#[derive(Default)]
+struct CallsiteStats {
+    records: u64,
+    estimated_payload_bytes: u64,
+}
+
+#[cfg(feature = "callsite_stats")]
+fn update_callsite_stats(
+    msg: &fluent::Message,
+    stats: &mut HashMap<String, CallsiteStats>,
+    total_records: &mut u64,
+    total_estimated_payload_bytes: &mut u64,
+) {
+    for record in msg.records() {
+        let estimated_payload_bytes = record.estimated_payload_bytes() as u64;
+        *total_records += 1;
+        *total_estimated_payload_bytes += estimated_payload_bytes;
+
+        let callsite = record
+            .callsite_key()
+            .unwrap_or_else(|| "<unknown-callsite>".to_owned());
+        let entry = stats.entry(callsite).or_default();
+        entry.records += 1;
+        entry.estimated_payload_bytes += estimated_payload_bytes;
+    }
+}
+
+#[cfg(not(feature = "callsite_stats"))]
+fn update_callsite_stats(
+    _msg: &fluent::Message,
+    _stats: &mut (),
+    _total_records: &mut u64,
+    _total_estimated_payload_bytes: &mut u64,
+) {
+}
+
+#[cfg(feature = "callsite_stats")]
+fn write_callsite_stats(
+    stats_path: &str,
+    stats: &HashMap<String, CallsiteStats>,
+    total_records: u64,
+    total_estimated_payload_bytes: u64,
+) -> std::io::Result<()> {
+    let mut rows: Vec<_> = stats.iter().collect();
+    rows.sort_by(|left, right| {
+        right
+            .1
+            .estimated_payload_bytes
+            .cmp(&left.1.estimated_payload_bytes)
+            .then_with(|| right.1.records.cmp(&left.1.records))
+            .then_with(|| left.0.cmp(right.0))
+    });
+
+    let mut output = String::new();
+    let _ = writeln!(output, "# total_records={total_records}");
+    let _ = writeln!(
+        output,
+        "# total_estimated_payload_bytes={total_estimated_payload_bytes}"
+    );
+    let _ = writeln!(
+        output,
+        "estimated_share_pct\testimated_payload_bytes\trecords\tcallsite"
+    );
+
+    for (callsite, stat) in rows.into_iter().take(100) {
+        let share_pct = if total_estimated_payload_bytes == 0 {
+            0.0
+        } else {
+            (stat.estimated_payload_bytes as f64 * 100.0) / total_estimated_payload_bytes as f64
+        };
+        let _ = writeln!(
+            output,
+            "{share_pct:.4}\t{}\t{}\t{}",
+            stat.estimated_payload_bytes, stat.records, callsite
+        );
+    }
+
+    let temp_path = format!("{stats_path}.tmp");
+    fs::write(&temp_path, output)?;
+    fs::rename(temp_path, stats_path)
+}
+
+#[cfg(feature = "callsite_stats")]
+fn flush_callsite_stats(
+    stats_path: &str,
+    stats: &HashMap<String, CallsiteStats>,
+    total_records: u64,
+    total_estimated_payload_bytes: u64,
+    last_stats_write: &mut Instant,
+) {
+    if let Err(error) = write_callsite_stats(
+        stats_path,
+        stats,
+        total_records,
+        total_estimated_payload_bytes,
+    ) {
+        eprintln!(
+            "tracing-fluentd: failed to write callsite stats to {}: {}",
+            stats_path, error
+        );
+    } else {
+        *last_stats_write = Instant::now();
+    }
+}
+
+fn write_message<W: Write>(
+    writer: &mut W,
+    msg: &fluent::Message,
+    encoded_msg: &mut Vec<u8>,
+) -> Result<(), String> {
+    encoded_msg.clear();
+    rmp_serde::encode::write(encoded_msg, msg).map_err(|error| error.to_string())?;
+    writer
+        .write_all(encoded_msg.as_slice())
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())
+}
 
 pub enum Message {
     Record(fluent::Record),
@@ -135,7 +258,29 @@ pub fn thread<MW: MakeWriter>(
 
     let worker = worker.spawn(move || {
         let mut msg = fluent::Message::new(tag);
+        let mut encoded_msg = Vec::with_capacity(64 * 1024);
         let mut ongoing_writer = None;
+        #[cfg(feature = "callsite_stats")]
+        let mut callsite_stats = HashMap::<String, CallsiteStats>::new();
+        #[cfg(not(feature = "callsite_stats"))]
+        let mut callsite_stats = ();
+        let mut total_records = 0_u64;
+        let mut total_estimated_payload_bytes = 0_u64;
+        #[cfg(feature = "callsite_stats")]
+        let mut last_stats_write = Instant::now();
+        #[cfg(not(feature = "callsite_stats"))]
+        let _last_stats_write = ();
+        #[cfg(feature = "callsite_stats")]
+        let callsite_stats_path = std::env::var("TRACING_FLUENTD_CALLSITE_STATS_PATH")
+            .unwrap_or_else(|_| {
+                if fs::metadata("/tmp/ice-profiles").is_ok() {
+                    "/tmp/ice-profiles/tracing-fluentd-callsite-stats.tsv".to_owned()
+                } else {
+                    "tracing-fluentd-callsite-stats.tsv".to_owned()
+                }
+            });
+        #[cfg(not(feature = "callsite_stats"))]
+        let _callsite_stats_path = "";
 
         'main_loop: loop {
             let mut flush_notify: Option<SyncSender<()>> = None;
@@ -189,7 +334,24 @@ pub fn thread<MW: MakeWriter>(
                 },
             };
 
-            match rmp_serde::encode::write(&mut writer, &msg) {
+            update_callsite_stats(
+                &msg,
+                &mut callsite_stats,
+                &mut total_records,
+                &mut total_estimated_payload_bytes,
+            );
+            #[cfg(feature = "callsite_stats")]
+            if flush_notify.is_some() || last_stats_write.elapsed() >= Duration::from_secs(1) {
+                flush_callsite_stats(
+                    &callsite_stats_path,
+                    &callsite_stats,
+                    total_records,
+                    total_estimated_payload_bytes,
+                    &mut last_stats_write,
+                );
+            }
+
+            match write_message(&mut writer, &msg, &mut encoded_msg) {
                 Ok(()) => {
                     msg.clear();
                     ongoing_writer = Some(writer);
@@ -235,7 +397,22 @@ pub fn thread<MW: MakeWriter>(
                     },
                 };
 
-                if let Err(error) = rmp_serde::encode::write(&mut writer, &msg) {
+                update_callsite_stats(
+                    &msg,
+                    &mut callsite_stats,
+                    &mut total_records,
+                    &mut total_estimated_payload_bytes,
+                );
+                #[cfg(feature = "callsite_stats")]
+                flush_callsite_stats(
+                    &callsite_stats_path,
+                    &callsite_stats,
+                    total_records,
+                    total_estimated_payload_bytes,
+                    &mut last_stats_write,
+                );
+
+                if let Err(error) = write_message(&mut writer, &msg, &mut encoded_msg) {
                     tracing::event!(
                         tracing::Level::INFO,
                         "Failed to send last records to fluent server {}",
